@@ -1,5 +1,7 @@
 .bsp
 .bloop
 .idea
+.metals
+.vscode
 target
 
