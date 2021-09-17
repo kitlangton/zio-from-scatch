@@ -11,13 +11,10 @@ object Person {
 trait ZIOApp {
   def run: ZIO[Any]
 
-  def main(args: Array[String]): Unit = {
+  def main(args: Array[String]): Unit =
     run.run { result =>
       println(s"THE RESULT WAS $result")
     }
-
-    Thread.sleep(3000)
-  }
 }
 
 object succeedNow extends ZIOApp {
@@ -163,4 +160,12 @@ object zipPar extends ZIOApp {
   }
 
   def run = asyncZIO zipPar asyncZIO
+}
+
+object StackSafety extends ZIOApp {
+
+  val myProgram =
+    ZIO.succeed(println("Howdy!")).repeat(100000)
+
+  def run = myProgram
 }
