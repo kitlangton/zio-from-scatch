@@ -3,8 +3,8 @@ package zio
 import zio.examples.Person
 
 import scala.concurrent.ExecutionContext
+import zio.ZIO.SucceedNow
 import zio.ZIO.Succeed
-import zio.ZIO.Effect
 import zio.ZIO.Async
 import zio.ZIO.Fork
 
@@ -13,28 +13,30 @@ import java.util.concurrent.atomic.AtomicReference
 // Declarative encoding CHECK
 // Stack safety CHECK
 // Concurrency safety CHECK
-// Custom ExecutionContext
+// Custom ExecutionContext CHECK
 // Interruption
 // Error handling
 // Environment
 
-trait Fiber[+A] {
-  def start: Unit
+trait Fiber[+E, +A] {
 
-  def join: ZIO[A]
+  def join: ZIO[E, A]
+
+  def interrupt: ZIO[Nothing, Unit] =
+    ???
 }
 
-class FiberImpl[A](zio: ZIO[A]) extends Fiber[A] {
+private final case class FiberContext[E, A](startZIO: ZIO[E, A], startExecutor: ExecutionContext) extends Fiber[E, A] {
 
   sealed trait FiberState
 
-  case class Running(callbacks: List[A => Any]) extends FiberState
-  case class Done(result: A)                    extends FiberState
+  case class Running(callbacks: List[Either[E, A] => Any]) extends FiberState
+  case class Done(result: Either[E, A])                    extends FiberState
 
   val state: AtomicReference[FiberState] =
     new AtomicReference(Running(List.empty))
 
-  def complete(result: A): Unit = {
+  def complete(result: Either[E, A]): Unit = {
     var loop = true
     while (loop) {
       val oldState = state.get
@@ -50,7 +52,7 @@ class FiberImpl[A](zio: ZIO[A]) extends Fiber[A] {
     }
   }
 
-  def await(callback: A => Any): Unit = {
+  def await(callback: Either[E, A] => Any): Unit = {
     var loop = true
     while (loop) {
       val oldState = state.get
@@ -65,185 +67,220 @@ class FiberImpl[A](zio: ZIO[A]) extends Fiber[A] {
     }
   }
 
-  // === CAS ===
-  // compare and swap
+  override def join: ZIO[E, A] =
+    ZIO
+      .async[Either[E, A]] { callback =>
+        await(callback)
+      }
+      .flatMap(ZIO.fromEither)
 
-  var i = 0
+  type Erased         = ZIO[Any, Any]
+  type ErasedCallback = Any => Any
+  type Cont           = Any => Erased
 
-  // Expectations in synchronous world
+  def erase[E, A](zio: ZIO[E, A]): Erased =
+    zio
 
-  // Thread #1
-  // get the old value of 0
-  // do some operation on it (0 + 1)
-  // set it to the new value only if equal to old value (1)
-  // otherwise go back to first step
+  def eraseCallback[A](cb: A => Unit): ErasedCallback =
+    cb.asInstanceOf[ErasedCallback]
 
-  // Thread #2
-  // get the old value of 1
-  // do some operation on it (1 + 1)
-  // set it to the new value (2)
+  val stack = new scala.collection.mutable.Stack[Cont]()
 
-  // One possible order of execution
+  var currentZIO      = erase(startZIO)
+  var currentExecutor = startExecutor
 
-  // === ATOM ===
-  // late 15th century: from Old French atome,
-  // via Latin from Greek atomos ‘indivisible’,
-  // based on a- ‘not’ + temnein ‘to cut’.
-  // "Atom" Fraser
+  var loop = true
 
-  // T1: get the old value of 0
-  // T1: do some operation on it (0 + 1)
-  // T2: get the old value of 0
-  // T1: set it to the new value (1) if it is 0 (what we got above)
-  // T2: do some operation on it (0 + 1)
-  // T2: set it to the new value (1) if it is 0 (what we got above) — NO IT WAS 1! HELP! 🍜😭 OH NO!
+  def resume(): Unit = {
+    loop = true
+    run()
+  }
 
-  // for {
-  //   _ <- ZIO.succeed(i += 1).fork.repeat(10000)
-  //   value <- ZIO.succeed(i)
-  // } yield value
-
-  var maybeResult: Option[A] = None
-  var callbacks              = List.empty[A => Any]
-
-  override def start: Unit =
-    ExecutionContext.global.execute { () =>
-      zio.run(complete)
+  def continue(value: Any): Unit =
+    if (stack.isEmpty) {
+      loop = false
+      complete(Right(value.asInstanceOf[A]))
+    } else {
+      val cont = stack.pop()
+      currentZIO = cont(value)
     }
 
-  override def join: ZIO[A] =
-    ZIO.async { callback =>
-      await(callback)
-    }
+  def findNextErrorHandler(): ZIO.Fold[Any, Any, Any, Any] = {
+    var loop                                       = true
+    var errorHandler: ZIO.Fold[Any, Any, Any, Any] = null
+    while (loop)
+      if (stack.isEmpty) loop = false
+      else {
+        val cont = stack.pop()
+        if (cont.isInstanceOf[ZIO.Fold[Any, Any, Any, Any]]) {
+          errorHandler = cont.asInstanceOf[ZIO.Fold[Any, Any, Any, Any]]
+          loop = false
+        }
+      }
+    errorHandler
+  }
 
+  def run(): Unit =
+    while (loop)
+      currentZIO match {
+        case ZIO.SucceedNow(value) =>
+          continue(value)
+
+        case ZIO.Succeed(thunk) =>
+          continue(thunk())
+
+        case ZIO.FlatMap(zio, cont) =>
+          stack.push(cont)
+          currentZIO = zio
+
+        case ZIO.Async(register) =>
+          if (stack.isEmpty) {
+            loop = false
+            register(a => complete(Right(a.asInstanceOf[A])))
+          } else {
+            loop = false
+            register { a =>
+              currentZIO = ZIO.succeedNow(a)
+              resume()
+            }
+          }
+
+        case ZIO.Fork(zio) =>
+          val fiber = FiberContext(zio, currentExecutor)
+          continue(fiber)
+
+        case ZIO.Shift(executor) =>
+          currentExecutor = executor
+          continue(())
+
+        case ZIO.Fail(e) =>
+          val errorHandler = findNextErrorHandler()
+          if (errorHandler eq null) {
+            complete(Left(e().asInstanceOf[E]))
+          } else {
+            currentZIO = errorHandler.failure(e())
+          }
+
+        case fold @ ZIO.Fold(zio, failure, success) =>
+          stack.push(fold)
+          currentZIO = zio
+      }
+
+  currentExecutor.execute(() => run())
 }
 
-sealed trait ZIO[+A] { self =>
+sealed trait ZIO[+E, +A] { self =>
 
-  def fork: ZIO[Fiber[A]] =
+  def fork: ZIO[Nothing, Fiber[E, A]] =
     ZIO.Fork(self)
 
-  def as[B](value: => B): ZIO[B] =
+  def as[B](value: => B): ZIO[E, B] =
     self.map(_ => value)
 
-  def flatMap[B](f: A => ZIO[B]): ZIO[B] =
+  def catchAll[E2, A1 >: A](f: E => ZIO[E2, A1]): ZIO[E2, A1] =
+    foldZIO(e => f(e), a => ZIO.succeedNow(a))
+
+  def flatMap[E1 >: E, B](f: A => ZIO[E1, B]): ZIO[E1, B] =
     ZIO.FlatMap(self, f)
 
-  def map[B](f: A => B): ZIO[B] =
+  def fold[B](failure: E => B, success: A => B): ZIO[E, B] =
+    foldZIO(e => ZIO.succeedNow(failure(e)), a => ZIO.succeedNow(success(a)))
+
+  def foldZIO[E2, B](failure: E => ZIO[E2, B], success: A => ZIO[E2, B]): ZIO[E2, B] =
+    ZIO.Fold(self, failure, success)
+
+  def map[B](f: A => B): ZIO[E, B] =
     flatMap(f andThen ZIO.succeedNow)
 //    flatMap { a => ZIO.succeedNow(f(a)) }
 //    ZIO.Map(self, f)
 
-  def repeat(n: Int): ZIO[Unit] =
+  def repeat(n: Int): ZIO[E, Unit] =
     if (n <= 0) ZIO.succeedNow()
     else self *> repeat(n - 1)
 
-  def zipPar[B](that: ZIO[B]): ZIO[(A, B)] =
+  def shift(executor: ExecutionContext): ZIO[Nothing, Unit] =
+    ZIO.Shift(executor)
+
+  def zipPar[E1 >: E, B](that: ZIO[E1, B]): ZIO[E1, (A, B)] =
     for {
       f1 <- self.fork
       b  <- that
       a  <- f1.join
     } yield (a, b)
 
-  def zip[B](that: ZIO[B]): ZIO[(A, B)] =
+  def zip[E1 >: E, B](that: ZIO[E1, B]): ZIO[E1, (A, B)] =
     zipWith(that)(_ -> _)
 
-  def *>[B](that: => ZIO[B]): ZIO[B] =
+  def *>[E1 >: E, B](that: => ZIO[E1, B]): ZIO[E1, B] =
     self zipRight that
 
-  def zipRight[B](that: => ZIO[B]): ZIO[B] =
+  def zipRight[E1 >: E, B](that: => ZIO[E1, B]): ZIO[E1, B] =
     zipWith(that)((_, b) => b)
 
-  def zipWith[B, C](that: => ZIO[B])(f: (A, B) => C): ZIO[C] =
+  def zipWith[E1 >: E, B, C](that: => ZIO[E1, B])(f: (A, B) => C): ZIO[E1, C] =
     for {
       a <- self
       b <- that
     } yield f(a, b)
 
-  final def run(callback: A => Unit): Unit = {
+  private final def unsafeRunFiber: Fiber[E, A] =
+    FiberContext(self, ZIO.defaultExecutor)
 
-    type Erased         = ZIO[Any]
-    type ErasedCallback = Any => Any
-    type Cont           = Any => Erased
-
-    def erase[A](zio: ZIO[A]): Erased =
-      zio
-
-    def eraseCallback[A](cb: A => Unit): ErasedCallback =
-      cb.asInstanceOf[ErasedCallback]
-
-    val stack = new scala.collection.mutable.Stack[Cont]()
-
-    var currentZIO = erase(self)
-
-    var loop = true
-
-    def resume(): Unit = {
-      loop = true
-      run()
-    }
-
-    def complete(value: Any): Unit =
-      if (stack.isEmpty) {
-        loop = false
-        callback(value.asInstanceOf[A])
-      } else {
-        val cont = stack.pop()
-        currentZIO = cont(value)
-      }
-
-    def run(): Unit =
-      while (loop)
-        currentZIO match {
-          case ZIO.Succeed(value) =>
-            complete(value)
-
-          case ZIO.Effect(thunk) =>
-            complete(thunk())
-
-          case ZIO.FlatMap(zio, cont) =>
-            stack.push(cont)
-            currentZIO = zio
-
-          case ZIO.Async(register) =>
-            if (stack.isEmpty) {
-              loop = false
-              register(eraseCallback(callback))
-            } else {
-              loop = false
-              register { a =>
-                currentZIO = ZIO.succeedNow(a)
-                resume()
-              }
-            }
-
-          case ZIO.Fork(zio) =>
-            val fiber = new FiberImpl(zio)
-            fiber.start
-            complete(fiber)
+  final def unsafeRunSync: Either[E, A] = {
+    val latch                = new java.util.concurrent.CountDownLatch(1)
+    var result: Either[E, A] = null.asInstanceOf[Either[E, A]]
+    val zio = self.foldZIO(
+      e =>
+        ZIO.succeed {
+          result = Left(e)
+          latch.countDown()
+        },
+      a =>
+        ZIO.succeed {
+          result = Right(a)
+          latch.countDown()
         }
-
-    run()
+    )
+    zio.unsafeRunFiber
+    latch.await()
+    result
   }
-
 }
 
 object ZIO {
-  def async[A](register: (A => Any) => Any): ZIO[A] =
+  def async[A](register: (A => Any) => Any): ZIO[Nothing, A] =
     ZIO.Async(register)
 
-  def succeed[A](value: => A): ZIO[A] =
-    ZIO.Effect(() => value)
+  def fail[E](e: => E): ZIO[E, Nothing] =
+    Fail(() => e)
 
-  def succeedNow[A](value: A): ZIO[A] = ZIO.Succeed(value)
+  def fromEither[E, A](either: Either[E, A]): ZIO[E, A] =
+    either.fold(e => fail(e), a => succeedNow(a))
 
-  case class Succeed[A](value: A) extends ZIO[A]
+  def succeed[A](value: => A): ZIO[Nothing, A] =
+    ZIO.Succeed(() => value)
 
-  case class Effect[A](f: () => A) extends ZIO[A]
+  def succeedNow[A](value: A): ZIO[Nothing, A] = ZIO.SucceedNow(value)
 
-  case class FlatMap[A, B](zio: ZIO[A], f: A => ZIO[B]) extends ZIO[B]
+  case class SucceedNow[A](value: A) extends ZIO[Nothing, A]
 
-  case class Async[A](register: (A => Any) => Any) extends ZIO[A]
+  case class Succeed[A](f: () => A) extends ZIO[Nothing, A]
 
-  case class Fork[A](zio: ZIO[A]) extends ZIO[Fiber[A]]
+  case class FlatMap[E, A, B](zio: ZIO[E, A], f: A => ZIO[E, B]) extends ZIO[E, B]
+
+  case class Async[A](register: (A => Any) => Any) extends ZIO[Nothing, A]
+
+  case class Fork[E, A](zio: ZIO[E, A]) extends ZIO[Nothing, Fiber[E, A]]
+
+  case class Shift(executor: ExecutionContext) extends ZIO[Nothing, Unit]
+
+  case class Fail[E](e: () => E) extends ZIO[E, Nothing]
+
+  case class Fold[E, E2, A, B](zio: ZIO[E, A], failure: E => ZIO[E2, B], success: A => ZIO[E2, B])
+      extends ZIO[E2, B]
+      with (A => ZIO[E2, B]) {
+    def apply(a: A): ZIO[E2, B] = success(a)
+  }
+
+  private val defaultExecutor = ExecutionContext.global
 }
