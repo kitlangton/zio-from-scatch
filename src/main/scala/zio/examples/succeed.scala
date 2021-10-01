@@ -13,7 +13,7 @@ trait ZIOApp {
 
   def main(args: Array[String]): Unit = {
     val result = run.unsafeRunSync
-    println(s"THE RESULT WAS $result")
+    println(s"🐶${scala.Console.BLUE}WOOF WOOF WOOOOF!${scala.Console.RESET} 👉 $result")
   }
 }
 
@@ -179,4 +179,31 @@ object ErrorHandling extends ZIOApp {
       .catchAll(e => ZIO.succeed(println("Recovered from an error")))
 
   def run = myProgram
+}
+
+object ErrorHandling2 extends ZIOApp {
+
+  val io: ZIO[Nothing, Int] =
+    ZIO
+      .succeed { throw new NoSuchElementException("No such element") }
+      .catchAll(_ => ZIO.succeed(println("This should never be shown")))
+      .foldCauseZIO(
+        c => ZIO.succeed(println(s"Recovered from a cause $c")) *> ZIO.succeed(1),
+        _ => ZIO.succeed(0)
+      ).map(_ + 10)
+
+  def run = io
+}
+
+object Interruption extends ZIOApp {
+
+  val io = for {
+    fiber <- (ZIO.succeed(println("Howdy!")).repeat(10000).uninterruptible *>
+                ZIO.succeed(println("Howdy Howdy!")).forever)
+      .ensuring(ZIO.succeed(println("Bowdy!"))).fork
+    _     <- ZIO.succeed(Thread.sleep(500))
+    _     <- fiber.interrupt
+  } yield ()
+
+  def run = io
 }
