@@ -8,24 +8,15 @@ object Person {
   val peter: Person = Person("Peter", 88)
 }
 
-trait ZIOApp {
-  def run: ZIO[Any, Any]
-
-  def main(args: Array[String]): Unit = {
-    val result = run.unsafeRunSync
-    println(s"🐶${scala.Console.BLUE}WOOF WOOF WOOOOF!${scala.Console.RESET} 👉 $result")
-  }
-}
-
 object succeedNow extends ZIOApp {
-  val peterZIO: ZIO[Nothing, Person] =
+  val peterZIO =
     ZIO.succeedNow(Person.peter)
 
   def run = peterZIO
 }
 
 object succeedNowUhOh extends ZIOApp {
-  val howdyZIO: ZIO[Nothing, Unit] =
+  val howdyZIO =
     ZIO.succeedNow(println("Howdy! 🐴🤠"))
 
   def run = ZIO.succeedNow(1)
@@ -39,7 +30,7 @@ object succeed extends ZIOApp {
 }
 
 object succeedAgain extends ZIOApp {
-  def printLine(message: String): ZIO[Nothing, Unit] =
+  def printLine(message: String) =
     ZIO.succeed(println(message))
 
   def run = printLine("Fancy 🤩")
@@ -53,15 +44,15 @@ object zip extends ZIOApp {
 }
 
 object map extends ZIOApp {
-  val zippedZIO: ZIO[Nothing, (Int, String)] =
+  val zippedZIO: ZIO[Any, Nothing, (Int, String)] =
     ZIO.succeed(8) zip ZIO.succeed("LO")
 
-  val personZIO: ZIO[Nothing, Person] =
+  val personZIO: ZIO[Any, Nothing, Person] =
     zippedZIO.map { case (int, string) =>
       Person(string, int)
     }
 
-  val mappedZIO: ZIO[Nothing, String] =
+  val mappedZIO: ZIO[Any, Nothing, String] =
     zippedZIO.map { case (int, string) =>
       string * int
     }
@@ -70,13 +61,13 @@ object map extends ZIOApp {
 }
 
 object mapUhOh extends ZIOApp {
-  val zippedZIO: ZIO[Nothing, (Int, String)] =
+  val zippedZIO: ZIO[Any, Nothing, (Int, String)] =
     ZIO.succeed(8) zip ZIO.succeed("LO")
 
-  def printLine(message: String): ZIO[Nothing, Unit] =
+  def printLine(message: String): ZIO[Any, Nothing, Unit] =
     ZIO.succeed(println(message))
 
-  val mappedZIO: ZIO[Nothing, ZIO[Nothing, Unit]] =
+  val mappedZIO: ZIO[Any, Nothing, ZIO[Any, Nothing, Unit]] =
     zippedZIO.map { tuple =>
       printLine(s"MY BEAUTIFUL TUPLE: $tuple")
     }
@@ -85,10 +76,10 @@ object mapUhOh extends ZIOApp {
 }
 
 object flatMap extends ZIOApp {
-  val zippedZIO: ZIO[Nothing, (Int, String)] =
+  val zippedZIO: ZIO[Any, Nothing, (Int, String)] =
     ZIO.succeed(8) zip ZIO.succeed("LO")
 
-  def printLine(message: String): ZIO[Nothing, Unit] =
+  def printLine(message: String): ZIO[Any, Nothing, Unit] =
     ZIO.succeed(println(message))
 
   val flatMappedZIO =
@@ -100,10 +91,10 @@ object flatMap extends ZIOApp {
 }
 
 object forComprehension extends ZIOApp {
-  val zippedZIO: ZIO[Nothing, (Int, String)] =
+  val zippedZIO: ZIO[Any, Nothing, (Int, String)] =
     ZIO.succeed(8) zip ZIO.succeed("LO")
 
-  def printLine(message: String): ZIO[Nothing, Unit] =
+  def printLine(message: String): ZIO[Any, Nothing, Unit] =
     ZIO.succeed(println(message))
 
   val flatMappedZIO =
@@ -119,7 +110,7 @@ object forComprehension extends ZIOApp {
 }
 
 object async extends ZIOApp {
-  val asyncZIO: ZIO[Nothing, Int] =
+  val asyncZIO: ZIO[Any, Nothing, Int] =
     ZIO.async[Int] { complete =>
       println("ASYNC BEGINNETH!")
       Thread.sleep(2000)
@@ -136,7 +127,7 @@ object fork extends ZIOApp {
     complete(scala.util.Random.nextInt(999))
   }
 
-  def printLine(message: String): ZIO[Nothing, Unit] =
+  def printLine(message: String): ZIO[Any, Nothing, Unit] =
     ZIO.succeed(println(message))
 
   //       + ------------------------------> Int
@@ -183,7 +174,7 @@ object ErrorHandling extends ZIOApp {
 
 object ErrorHandling2 extends ZIOApp {
 
-  val io: ZIO[Nothing, Int] =
+  val io: ZIO[Any, Nothing, Int] =
     ZIO
       .succeed { throw new NoSuchElementException("No such element") }
       .catchAll(_ => ZIO.succeed(println("This should never be shown")))
